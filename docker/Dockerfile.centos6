@@ -35,7 +35,8 @@ WORKDIR $SOURCE_DIR
 
 RUN wget -q https://cmake.org/files/v$CMAKE_VERSION_BASE/cmake-$CMAKE_VERSION-Linux-x86_64.tar.gz && tar zxf cmake-$CMAKE_VERSION-Linux-x86_64.tar.gz && mv cmake-$CMAKE_VERSION-Linux-x86_64 /opt/ && echo 'PATH=/opt/cmake-$CMAKE_VERSION-Linux-x86_64/bin:$PATH' >> ~/.bashrc
 RUN wget -q https://github.com/ninja-build/ninja/releases/download/v$NINJA_VERSION/ninja-linux.zip && unzip ninja-linux.zip && mkdir -p /opt/ninja-$NINJA_VERSION/bin && mv ninja /opt/ninja-$NINJA_VERSION/bin && echo 'PATH=/opt/ninja-$NINJA_VERSION/bin:$PATH' >> ~/.bashrc
-RUN wget -q https://storage.googleapis.com/golang/go$GO_VERSION.linux-amd64.tar.gz && tar zxf go$GO_VERSION.linux-amd64.tar.gz && mv go /opt/ && echo 'PATH=/opt/go/bin:$PATH' >> ~/.bashrc && echo 'export GOROOT=/opt/go/' >> ~/.bashrc
+# storage.googleapis.com/golang now answers 403, Go archives are served from dl.google.com.
+RUN wget -q https://dl.google.com/go/go$GO_VERSION.linux-amd64.tar.gz && tar zxf go$GO_VERSION.linux-amd64.tar.gz && mv go /opt/ && echo 'PATH=/opt/go/bin:$PATH' >> ~/.bashrc && echo 'export GOROOT=/opt/go/' >> ~/.bashrc
 
 RUN yum install -y centos-release-scl
 # Update repository urls as we need to use the vault now.
@@ -49,14 +50,17 @@ RUN rm -rf $SOURCE_DIR
 
 ARG java_version=1.8
 ENV JAVA_VERSION $java_version
-# installing java with jabba
-RUN curl -sL https://github.com/shyiko/jabba/raw/master/install.sh | JABBA_COMMAND="install $JAVA_VERSION -o /jdk" bash
+# installing java: jabba (shyiko/jabba is archived) resolved adopt@1.8.0-272 to this AdoptOpenJDK tarball, which is
+# downloaded directly into /jdk instead.
+RUN curl -sSLf https://github.com/AdoptOpenJDK/openjdk8-binaries/releases/download/jdk8u272-b10/OpenJDK8U-jdk_x64_linux_hotspot_8u272b10.tar.gz | tar -xz -C / && mv /jdk8u272-b10 /jdk
 
 RUN echo 'export JAVA_HOME="/jdk"' >> ~/.bashrc
 RUN echo 'PATH=/jdk/bin:$PATH' >> ~/.bashrc
 
 WORKDIR /opt
-RUN curl https://downloads.apache.org/maven/maven-3/3.6.3/binaries/apache-maven-3.6.3-bin.tar.gz | tar -xz
+# downloads.apache.org only keeps the current Maven release, and archive.apache.org times out / resets TLS from CI
+# runners; the identical apache-maven 3.6.3 distribution is published on Maven Central.
+RUN curl -sSLf https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/3.6.3/apache-maven-3.6.3-bin.tar.gz | tar -xz
 RUN echo 'PATH=/opt/apache-maven-3.6.3/bin/:$PATH' >> ~/.bashrc
 
 # Prepare our own build

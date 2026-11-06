@@ -1,88 +1,232 @@
 name: Build project
 
 on:
-  push:
-    branches: [ main ]
-
-  schedule:
-    - cron: '30 3 * * 1'  # At 03:30 on Monday, every Monday.
-
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional surefire -Dtest selector; empty runs the full suite'
+        required: false
+        default: ''
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     strategy:
+      fail-fast: false
       matrix:
         include:
           - setup: centos6-x86_64
             docker-compose-build: "-f docker/docker-compose.centos-6.yaml -f docker/docker-compose.centos-6.18.yaml build"
             docker-compose-run: "-f docker/docker-compose.centos-6.yaml -f docker/docker-compose.centos-6.18.yaml run build"
+            artifact-paths: boringssl-static/target/netty-tcnative-boringssl-static-*-linux-x86_64.jar
           - setup: debian7-x86_64
             docker-compose-build: "-f docker/docker-compose.debian.yaml -f docker/docker-compose.debian-7.18.yaml build"
             docker-compose-run: "-f docker/docker-compose.debian.yaml -f docker/docker-compose.debian-7.18.yaml run build-dynamic-only"
+            artifact-paths: ''
           - setup: centos7-aarch64
             docker-compose-build: "-f docker/docker-compose.centos-7.yaml build"
             docker-compose-run: "-f docker/docker-compose.centos-7.yaml run cross-compile-aarch64-build"
+            artifact-paths: boringssl-static/target/netty-tcnative-boringssl-static-*-linux-aarch_64.jar
 
     name: ${{ matrix.setup }}
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-      # Enable caching of Docker layers
-      - uses: satackey/action-docker-layer-caching@v0.0.11
-        continue-on-error: true
-        with:
-          key: build-${{ matrix.setup }}-docker-cache-{hash}
-          restore-keys: |
-            build-${{ matrix.setup }}-docker-cache-
+      # satackey/action-docker-layer-caching (only an optimisation, run with continue-on-error) uses the retired
+      # cache service API, so it is dropped.
 
       - name: Build docker image
-        run: docker-compose ${{ matrix.docker-compose-build }}
+        run: docker compose ${{ matrix.docker-compose-build }}
+
+      # Maven inside the container reads /code/.mvn/maven.config, so a dispatch-time test selector reaches surefire.
+      - name: Apply test filter
+        if: ${{ inputs.test-filter != '' }}
+        run: echo "-Dtest=${{ inputs.test-filter }} -Dsurefire.failIfNoSpecifiedTests=false -DfailIfNoTests=false" > .mvn/maven.config
 
       - name: Build project
-        run: docker-compose ${{ matrix.docker-compose-run }} | tee build.output
+        run: docker compose ${{ matrix.docker-compose-run }} | tee build.output
 
       - name: Checking for test failures
         run: ./.github/scripts/check_build_result.sh build.output
 
-      - uses: actions/upload-artifact@v2
+      - name: Upload native classifier jar
+        if: ${{ matrix.artifact-paths != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: classifier-jar-${{ matrix.setup }}
+          path: ${{ matrix.artifact-paths }}
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
         if: ${{ failure() }}
         with:
           name: build-${{ matrix.setup }}-target
-          path: "**/target/"
+          path: "**/target/surefire-reports/"
 
 
   build-windows:
-    runs-on: windows-2016
+    runs-on: windows-2022
+    timeout-minutes: 50
     name: windows-x86_64
     steps:
-      - uses: actions/checkout@v2
+      # Keep LF line endings: the LICENSE/NOTICE files and pom.xml are packaged into the jar verbatim.
+      - name: Disable CRLF conversion
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
 
       - name: Set up JDK 8
-        uses: actions/setup-java@v1
+        uses: actions/setup-java@v4
         with:
           java-version: 8
+          distribution: zulu
 
       - name: Add msbuild to PATH
-        uses: microsoft/setup-msbuild@v1.0.2
+        uses: microsoft/setup-msbuild@v2
 
+      # windows-2016 is retired; on windows-2022 select the VS 2019 (v142) toolset that vs2010.vcxproj.static.template
+      # now links with, so BoringSSL is compiled against the same STL.
       - name: Configuring Developer Command Prompt
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x86_amd64
+          toolset: 14.29
 
       - name: Install tools
-        uses: crazy-max/ghaction-chocolatey@v1
+        uses: crazy-max/ghaction-chocolatey@v3
         with:
           args: install ninja nasm
 
       - name: Build netty-tcnative-boringssl-static
         run: mvn --file pom.xml -pl boringssl-static clean package
 
-      - uses: actions/upload-artifact@v2
+      - name: Upload native classifier jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: classifier-jar-windows-x86_64
+          path: boringssl-static/target/netty-tcnative-boringssl-static-*-windows-x86_64.jar
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
         if: ${{ failure() }}
         with:
           name: build-windows-target
-          path: "**/target/"
+          path: "**/target/surefire-reports/"
+
+  # The osx-x86_64 jar is released from a Mac outside of GitHub Actions upstream; build it natively here with the
+  # same command the windows leg uses. 'install' (instead of 'package') puts the platform jars into the local
+  # repository, which build-uber picks up through the cache below.
+  build-macos:
+    runs-on: macos-15-intel
+    timeout-minutes: 50
+    name: osx-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          java-version: 8
+          distribution: zulu
+
+      - name: Install tools
+        run: brew bundle --file=Brewfile
+
+      # This release was built with the Xcode 12 clang; the Xcode 16 clang on today's runners turns several of its
+      # warnings into errors:
+      # - APR 1.7.0's configure probes (e.g. the strerror_r return type) call undeclared functions, now a default
+      #   error; the failed probe picks the wrong strerror_r and errorcodes.c then fails with -Wint-conversion.
+      # - BoringSSL (-Werror) trips the new -Warray-parameter, and the tcnative JNI sources (configure.ac / pom
+      #   cflags -Werror) trip the new -Wunused-but-set-variable.
+      # The pom passes its own CFLAGS/CPPFLAGS to every one of those builds but takes the compiler from CC/CXX, so these
+      # wrappers call Apple clang with the release-era diagnostics appended last, keeping them warnings. No code
+      # generation flag changes.
+      - name: Create compiler wrappers that keep new clang diagnostics non-fatal
+        run: |
+          mkdir -p "$RUNNER_TEMP/cc-wrap"
+          FLAGS='-Wno-error -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-function-pointer-types'
+          printf '#!/bin/sh\nexec /usr/bin/clang "$@" %s\n' "$FLAGS" > "$RUNNER_TEMP/cc-wrap/cc"
+          printf '#!/bin/sh\nexec /usr/bin/clang++ "$@" -Wno-error\n' > "$RUNNER_TEMP/cc-wrap/c++"
+          chmod +x "$RUNNER_TEMP/cc-wrap/cc" "$RUNNER_TEMP/cc-wrap/c++"
+          cat "$RUNNER_TEMP/cc-wrap/cc" "$RUNNER_TEMP/cc-wrap/c++"
+
+      # Homebrew now ships CMake 4, which refuses the 2021 BoringSSL CMakeLists.txt (cmake_minimum_required < 3.5)
+      # unless a minimum policy version is supplied.
+      - name: Build netty-tcnative-boringssl-static
+        env:
+          CC: ${{ runner.temp }}/cc-wrap/cc
+          CXX: ${{ runner.temp }}/cc-wrap/c++
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+        run: ./mvnw -B --file pom.xml -pl boringssl-static clean install
+
+      - name: Upload native classifier jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: classifier-jar-osx-x86_64
+          path: boringssl-static/target/netty-tcnative-boringssl-static-*-osx-x86_64.jar
+          if-no-files-found: error
+
+      - name: Save installed netty-tcnative-boringssl-static artifacts
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.m2/repository/io/netty/netty-tcnative-boringssl-static
+          key: seal-uber-input-${{ github.run_id }}-${{ github.run_attempt }}
+
+  # The classifier-less jar is the uber-staging re-package (see boringssl-static/pom.xml): the Java classes plus the
+  # osx/linux/windows x86_64 and linux aarch_64 native libraries. Upstream builds it on an x86_64 Mac once all
+  # platform jars are staged; here they come from the legs above instead of the Sonatype staging repository.
+  build-uber:
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    needs: [build, build-windows, build-macos]
+    name: uber-jar
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          java-version: 8
+          distribution: zulu
+
+      - name: Restore installed netty-tcnative-boringssl-static artifacts
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.m2/repository/io/netty/netty-tcnative-boringssl-static
+          key: seal-uber-input-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+
+      - name: Download native classifier jars
+        uses: actions/download-artifact@v4
+        with:
+          pattern: classifier-jar-*
+          path: classifier-jars
+          merge-multiple: true
+
+      - name: Install native classifier jars into the local repository
+        run: |
+          # The os-maven-plugin banner still prints under -q, so the version is written to a file instead of stdout.
+          ./mvnw -q -N help:evaluate -Dexpression=project.version -Doutput="$RUNNER_TEMP/project-version.txt"
+          VERSION=$(tr -d '[:space:]' < "$RUNNER_TEMP/project-version.txt")
+          echo "project version: $VERSION"
+          for c in linux-x86_64 linux-aarch_64 windows-x86_64; do
+            ./mvnw -B -N install:install-file -Dfile=classifier-jars/netty-tcnative-boringssl-static-$VERSION-$c.jar \
+              -DgroupId=io.netty -DartifactId=netty-tcnative-boringssl-static -Dversion=$VERSION \
+              -Dclassifier=$c -Dpackaging=jar -DgeneratePom=false
+          done
+          ls -l ~/.m2/repository/io/netty/netty-tcnative-boringssl-static/$VERSION/
+
+      - name: Build netty-tcnative-boringssl-static uber jar
+        run: ./mvnw -B --file pom.xml -pl boringssl-static -P uber-staging clean package -DstagingRepositoryId=none
+
+      - name: Upload uber jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: uber-jar
+          path: |
+            boringssl-static/target/netty-tcnative-boringssl-static-*.jar
+            !boringssl-static/target/netty-tcnative-boringssl-static-*-javadoc.jar
+            !boringssl-static/target/netty-tcnative-boringssl-static-*-sources.jar
+          if-no-files-found: error
